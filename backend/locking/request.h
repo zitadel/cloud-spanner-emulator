@@ -39,6 +39,14 @@ class LockRequest {
   LockRequest(LockMode mode, TableID table_id, const KeyRange& key_range,
               const std::vector<ColumnID>& column_ids);
 
+  // Accessors. The lock manager needs these to evaluate conflicts at
+  // table + key-range + mode granularity instead of treating every request as
+  // a whole-database lock.
+  LockMode mode() const { return mode_; }
+  const TableID& table_id() const { return table_id_; }
+  const KeyRange& key_range() const { return key_range_; }
+  const std::vector<ColumnID>& column_ids() const { return column_ids_; }
+
  private:
   // The mode in which we want to acquire the lock.
   LockMode mode_;

@@ -85,14 +85,16 @@ class InMemoryStorage : public Storage {
   using Tables = absl::flat_hash_map<TableID, Table>;
 
   // Returns true if the given row is valid at the specified timestamp.
+  // Reached under a shared (reader) lock from Lookup/Read as well as under the
+  // exclusive lock from the mutating paths, so it only requires a shared lock.
   bool Exists(const Row& row, absl::Time timestamp) const
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      ABSL_SHARED_LOCKS_REQUIRED(mu_);
 
   // Returns the value for given row and column_id at the specified timestamp.
   googlesql::Value GetCellValueAtTimestamp(const Row& row,
                                            const ColumnID& column_id,
                                            absl::Time timestamp) const
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+      ABSL_SHARED_LOCKS_REQUIRED(mu_);
 
   void RemoveExpiredVersions(Cell& cell, absl::Time timestamp);
 

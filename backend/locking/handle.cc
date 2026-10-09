@@ -20,9 +20,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
 #include "backend/locking/manager.h"
-#include "common/errors.h"
 
 namespace google {
 namespace spanner {
@@ -37,10 +35,7 @@ LockHandle::LockHandle(LockManager* manager, TransactionID tid,
       try_abort_transaction_fn_(abort_fn),
       priority_(priority) {}
 
-LockHandle::~LockHandle() {
-  absl::MutexLock lock(mu_);
-  try_abort_transaction_fn_ = nullptr;
-}
+LockHandle::~LockHandle() { manager_->UnlockAll(this); }
 
 void LockHandle::EnqueueLock(const LockRequest& request) {
   manager_->EnqueueLock(this, request);
@@ -48,47 +43,11 @@ void LockHandle::EnqueueLock(const LockRequest& request) {
 
 void LockHandle::UnlockAll() { manager_->UnlockAll(this); }
 
-bool LockHandle::IsBlocked() {
-  // The current implementation never blocks.
-  absl::MutexLock lock(mu_);
-  return false;
-}
+bool LockHandle::IsBlocked() { return manager_->IsBlocked(this); }
 
-bool LockHandle::IsAborted() {
-  absl::MutexLock lock(mu_);
-  return !status_.ok();
-}
+bool LockHandle::IsAborted() { return manager_->IsAborted(this); }
 
-absl::Status LockHandle::Wait() {
-  // The current implementation never blocks.
-  absl::MutexLock lock(mu_);
-  return status_;
-}
-
-void LockHandle::Abort(const absl::Status& status) {
-  absl::MutexLock lock(mu_);
-  status_ = status;
-}
-
-absl::Status LockHandle::TryAbortTransaction(const absl::Status& status) {
-  if (mu_.try_lock()) {
-    if (try_abort_transaction_fn_ != nullptr) {
-      auto aborted = try_abort_transaction_fn_();
-      if (aborted.ok()) {
-        status_ = status;
-        mu_.unlock();
-        return absl::OkStatus();
-      }
-    }
-    mu_.unlock();
-  }
-  return error::CouldNotObtainLockHandleMutex(tid_);
-}
-
-void LockHandle::Reset() {
-  absl::MutexLock lock(mu_);
-  status_ = absl::OkStatus();
-}
+absl::Status LockHandle::Wait() { return manager_->Wait(this); }
 
 absl::StatusOr<absl::Time> LockHandle::ReserveCommitTimestamp() {
   return manager_->ReserveCommitTimestamp(this);

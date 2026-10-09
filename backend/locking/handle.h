@@ -17,13 +17,13 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_LOCKING_HANDLE_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_LOCKING_HANDLE_H_
 
-#include "absl/base/thread_annotations.h"
+#include <functional>
+
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
 #include "backend/common/ids.h"
 #include "backend/locking/request.h"
-#include "absl/status/status.h"
 
 namespace google {
 namespace spanner {
@@ -40,20 +40,21 @@ class LockManager;
 // happens via the LockHandle. This includes incremental acquisition of read
 // write locks, waiting on those locks, and unlocking those locks.
 //
-// EnqueueLock() is non-blocking and only enqueues the lock request. The
-// transaction can subsequently query whether the requests have completed by
-// checking IsBlocked() or perform a blocking Wait() to find out the final
-// state of the lock requests.
+// EnqueueLock() records a lock request. Wait() blocks until every request made
+// since the last Wait()/UnlockAll() has been granted, or the transaction has
+// been wounded (in which case Wait() returns ABORTED). All mutable lock state
+// lives in the LockManager and is guarded by its mutex; the handle itself is an
+// immutable addressable identity for one transaction.
 //
 // Usage (happy path, error handling skipped):
 //    // Get a handle.
-//    auto handle = lock_manager->CreateHandle(txn_id, txn_priority);
+//    auto handle = lock_manager->CreateHandle(txn_id, abort_fn, txn_priority);
 //
 //    // Request some locks.
 //    handle->EnqueueLock(...)
 //    handle->EnqueueLock(...)
 //
-//    // Wait for those locks to be granted.
+//    // Wait for those locks to be granted (blocks under contention).
 //    handle->Wait()
 //
 //    // Do work based on those locks.
@@ -69,32 +70,28 @@ class LockHandle {
   // Returns the priority of the transaction which owns this handle.
   TransactionPriority priority() { return priority_; }
 
-  // Enqueues a lock request for this transaction. This method returns
-  // immediately. Lock request status can be queried via IsBlocked() and Wait().
-  // Many lock requests can be queued up before calling Wait(). Lock requests
-  // from aborted handles are ignored by the lock manager.
+  // Enqueues a lock request for this transaction. Lock requests from aborted
+  // handles are ignored by the lock manager.
   void EnqueueLock(const LockRequest& request);
 
-  // Unlocks all locks held by this transaction. The transaction can acquire new
-  // locks using the same handle. Frees any waiters waiting on these locks. This
-  // method can be called even if the transaction never acquired any locks.
+  // Unlocks all locks held by this transaction and clears any aborted state, so
+  // the handle can be reused if the transaction retries. Frees any waiters
+  // blocked on these locks.
   void UnlockAll();
 
-  // Returns true if this handle is waiting on any lock requests to complete.
-  bool IsBlocked() ABSL_LOCKS_EXCLUDED(mu_);
+  // Returns true if this handle has a request that has not yet been granted.
+  bool IsBlocked();
 
-  // Returns true if this handle has been aborted by the lock manager. Previous
-  // locks acquired by the handle are not release automatically. The handle must
-  // explicitly call UnlockAll().
-  bool IsAborted() ABSL_LOCKS_EXCLUDED(mu_);
+  // Returns true if this handle has been wounded (aborted) by the lock manager
+  // and not yet released via UnlockAll().
+  bool IsAborted();
 
-  // Waits till all locks requested via this handle have either all been granted
-  // or have at least one request denied. Lock denials will return ABORTED
-  // status, otherwise OK will be returned.
-  absl::Status Wait() ABSL_LOCKS_EXCLUDED(mu_);
+  // Blocks until all locks requested via this handle have been granted, or the
+  // transaction has been wounded. Wounds return ABORTED, otherwise OK.
+  absl::Status Wait();
 
-  // Returns timestamp which can be used by this transaction as a commit
-  // timestamp.
+  // Returns a timestamp which this transaction may use as a commit timestamp.
+  // Returns ABORTED if the transaction has been wounded.
   absl::StatusOr<absl::Time> ReserveCommitTimestamp();
 
   // Notifies the LockManager that this transaction has committed.
@@ -105,45 +102,33 @@ class LockHandle {
   void WaitForSafeRead(absl::Time read_time);
 
  private:
-  // Only the LockManager is allowed to create and destroy LockHandles.
+  // Only the LockManager is allowed to create and destroy LockHandles, and it
+  // reads try_abort_transaction_fn_ when wounding this transaction.
   friend class LockManager;
   friend std::unique_ptr<LockHandle>::deleter_type;
   LockHandle(LockManager* manager, TransactionID tid,
              const std::function<absl::Status()>& abort_fn,
              TransactionPriority priority);
+  // Releases every lock, pending request, abort marker, and reserved commit
+  // timestamp this handle holds in the manager, so a transaction destroyed
+  // without an explicit UnlockAll (e.g. a wounded transaction discarded on
+  // retry) never leaves a dangling handle pointer in the manager's tables.
   ~LockHandle();
-
-  // Aborts the requests made by this handle (and puts it in a final state).
-  void Abort(const absl::Status& status) ABSL_LOCKS_EXCLUDED(mu_);
-  // Tries to abort this transaction. This is a best effort attempt and returns
-  // OK only if the transaction could successfully be aborted.
-  absl::Status TryAbortTransaction(const absl::Status& status)
-      ABSL_LOCKS_EXCLUDED(mu_);
-
-  // Resets the state of this handle.
-  void Reset() ABSL_LOCKS_EXCLUDED(mu_);
 
   // The LockManager which this LockHandle interacts with.
   LockManager* const manager_;
 
   // The ID of the transaction which owns this lock handle.
-  TransactionID tid_;
+  const TransactionID tid_;
 
-  // A function to try to abort the underlying transaction. The function will
-  // be called if another transaction wants to acquire the locks held by this
-  // transaction. The function will return OK only if the transaction was
-  // successfully aborted.
-  // This can be nullptr if the transaction cannot be aborted.
-  std::function<absl::Status()> try_abort_transaction_fn_;
+  // A best-effort callback to abort the owning transaction when it is wounded.
+  // Returns OK only if the transaction was successfully aborted. May be nullptr
+  // when the transaction cannot be aborted this way (e.g. schema changes).
+  const std::function<absl::Status()> try_abort_transaction_fn_;
 
-  // The priority of the transaction which owns this lock handle.
-  TransactionPriority priority_;
-
-  // Mutex to guard state below.
-  absl::Mutex mu_;
-
-  // The status of the lock handle requests.
-  absl::Status status_ ABSL_GUARDED_BY(mu_);
+  // The priority (age) of the transaction which owns this lock handle. Smaller
+  // is older; older transactions win under wound-wait.
+  const TransactionPriority priority_;
 };
 
 }  // namespace backend
