@@ -40,8 +40,8 @@ build --cxxopt=-D_GLIBCXX_USE_CXX11_ABI=1
 build --spawn_strategy=local,worker,standalone
 
 # Set resource limits for Docker builds.
-build --jobs=auto  # Let Bazel decide parallelism based on budget
-build --local_resources=memory=HOST_RAM*0.7  # Leave 30% for the OS/Docker overhead
+build --jobs=3  # capped for the 16GB GitHub-hosted runner (GoogleSQL TUs need ~GBs each)
+build --local_resources=memory=HOST_RAM*0.6
 build --local_resources=cpu=HOST_CPUS
 
 # Use workers for compiler heavy tasks.
