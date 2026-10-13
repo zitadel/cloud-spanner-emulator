@@ -54,6 +54,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Fail in the first minute, not after the compile, if this workflow cannot
+      # publish to the package (for instance when the organisation restricts who
+      # may create packages). It also creates the package already linked to this
+      # repository.
+      - name: Check that this workflow can publish to GHCR
+        run: |
+          printf 'FROM alpine:3.20\nLABEL org.opencontainers.image.source=%s\n' \
+            "${{ github.server_url }}/${{ github.repository }}" \
+            | docker buildx build --push -t "$IMAGE:ci-probe" -
+
       # Tags and labels. The source label links the package to this repository, so
       # it takes this repository's visibility and permissions.
       - name: Image metadata
@@ -75,7 +85,7 @@ jobs:
           platforms: linux/amd64
           push: false
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max,ignore-error=true
 
       - name: Build and push the image
         uses: docker/build-push-action@v6
@@ -87,4 +97,20 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+      # The image is only as good as its first start: run what was published.
+      - name: Smoke test the published image
+        run: |
+          docker run -d --name emulator -p 9010:9010 -p 9020:9020 \
+            "$IMAGE:sha-${{ github.sha }}"
+          for i in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/9010) 2>/dev/null; then
+              echo "emulator is listening on 9010"
+              docker logs emulator 2>&1 | tail -5
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs emulator 2>&1 | tail -30
+          echo "emulator did not start listening on 9010" >&2
+          exit 1
