@@ -1628,6 +1628,17 @@ absl::StatusOr<ChangeStreamQueryValidator::ChangeStreamMetadata>
 QueryEngine::TryGetChangeStreamMetadata(const Query& query,
                                         const Schema* schema,
                                         bool in_read_write_txn) const {
+  // A change stream query must call one of the change stream table-valued
+  // functions, whose names all start with "read_" (READ_, read_json_,
+  // read_proto_bytes_; identifiers are case-insensitive). Any other statement
+  // cannot be a change stream query and is analyzed in full by ExecuteSql
+  // anyway, so skip this second full analysis for it. A backslash could spell
+  // the name with an escape sequence inside a quoted identifier, so such text
+  // is never skipped.
+  if (!absl::StrContainsIgnoreCase(query.sql, "read_") &&
+      query.sql.find('\\') == std::string::npos) {
+    return ChangeStreamQueryValidator::ChangeStreamMetadata();
+  }
   const absl::Time start_time = absl::Now();
   Query local_query;
   NormalizeParameterNames(schema, query, &local_query);
