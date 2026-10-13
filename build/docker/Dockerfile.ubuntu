@@ -18,7 +18,17 @@
 #                                     BUILD                                    #
 ################################################################################
 
-FROM ubuntu:22.04 as build
+# What to build, and how, is a build argument so CI can rehearse the whole
+# pipeline on a tiny target. The defaults are the real build.
+ARG DEPS_TARGETS="@com_google_googlesql//googlesql/public:value @com_google_googlesql//googlesql/public:analyzer"
+ARG BUILD_TARGETS="//binaries:emulator_main //binaries:gateway_main"
+# How long one segment of the compile may run before it is stopped cleanly.
+ARG SEGMENT_SECONDS=2400
+# Two parallel jobs and a capped JVM keep a 16GB runner from running out of
+# memory: GoogleSQL translation units need several GB each.
+ARG BAZEL_FLAGS="--jobs=2"
+
+FROM ubuntu:22.04 AS toolchain
 
 # Perform all APT installs in a single layer to reduce image size.
 ENV GCC_VERSION=13
@@ -64,27 +74,108 @@ RUN wget -O /usr/local/bin/bazel https://github.com/bazelbuild/bazelisk/releases
 
 # Build GoogleSQL to cache it for reuse in subsequent Docker builds.
 # GoogleSQL can take 3h+ to build, so caching it saves a lot of time.
+#
+# The compile is a chain of time-boxed segments, each its own stage. A segment
+# stops Bazel cleanly when its time is up and the next one carries on from the
+# outputs already on disk. CI builds the stages one at a time and keeps each
+# one's layers, so a runner that dies part-way loses one segment, not the whole
+# compile. The stage after the last segment runs the build to completion, which
+# changes nothing when the segments already finished it.
+FROM toolchain AS deps-0
 WORKDIR /src
 COPY build/bazel build/bazel/
 COPY MODULE.bazel MODULE.bazel.lock* .bazelversion .bazelrc BUILD.bazel \
     requirements.txt go.mod go.sum ./
-RUN bazel build -c opt \
-    @com_google_googlesql//googlesql/public:value \
-    @com_google_googlesql//googlesql/public:analyzer
+
+FROM deps-0 AS deps-1
+ARG DEPS_TARGETS
+ARG SEGMENT_SECONDS
+ARG BAZEL_FLAGS
+RUN timeout -s INT -k 120 ${SEGMENT_SECONDS} \
+      bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${DEPS_TARGETS} ; \
+    bazel shutdown ; true
+
+FROM deps-1 AS deps-2
+ARG DEPS_TARGETS
+ARG SEGMENT_SECONDS
+ARG BAZEL_FLAGS
+RUN timeout -s INT -k 120 ${SEGMENT_SECONDS} \
+      bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${DEPS_TARGETS} ; \
+    bazel shutdown ; true
+
+FROM deps-2 AS deps-3
+ARG DEPS_TARGETS
+ARG SEGMENT_SECONDS
+ARG BAZEL_FLAGS
+RUN timeout -s INT -k 120 ${SEGMENT_SECONDS} \
+      bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${DEPS_TARGETS} ; \
+    bazel shutdown ; true
+
+FROM deps-3 AS deps-4
+ARG DEPS_TARGETS
+ARG SEGMENT_SECONDS
+ARG BAZEL_FLAGS
+RUN timeout -s INT -k 120 ${SEGMENT_SECONDS} \
+      bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${DEPS_TARGETS} ; \
+    bazel shutdown ; true
+
+FROM deps-4 AS deps-5
+ARG DEPS_TARGETS
+ARG SEGMENT_SECONDS
+ARG BAZEL_FLAGS
+RUN timeout -s INT -k 120 ${SEGMENT_SECONDS} \
+      bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${DEPS_TARGETS} ; \
+    bazel shutdown ; true
+
+FROM deps-5 AS deps
+ARG DEPS_TARGETS
+ARG BAZEL_FLAGS
+RUN bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${DEPS_TARGETS}
+
+################################################################################
+#                                   BUILD                                      #
+################################################################################
 
 # Copy over the emulator code base into the container.
+FROM deps AS build-0
 COPY . .
 
 # Make enum NodeTag compatible with both C and C++.
 RUN find third_party/spanner_pg -name "nodes.h" -exec sed -i 's/enum NodeTag : int/enum NodeTag/g' {} +
 
-# Build the emulator binaries only.
-# Since we are only copying the binaries to the release image, we don't need to
-# build the rest of the targets.
+# Build the emulator binaries only. Since we are only copying the binaries to
+# the release image, we don't need to build the rest of the targets. Segmented
+# like the dependencies above.
 ENV EXTRA_BAZEL_ARGS="--tool_java_runtime_version=local_jdk"
-RUN bazel build -c opt \
-    //binaries:emulator_main \
-    //binaries:gateway_main
+
+FROM build-0 AS build-1
+ARG BUILD_TARGETS
+ARG SEGMENT_SECONDS
+ARG BAZEL_FLAGS
+RUN timeout -s INT -k 120 ${SEGMENT_SECONDS} \
+      bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${BUILD_TARGETS} ; \
+    bazel shutdown ; true
+
+FROM build-1 AS build-2
+ARG BUILD_TARGETS
+ARG SEGMENT_SECONDS
+ARG BAZEL_FLAGS
+RUN timeout -s INT -k 120 ${SEGMENT_SECONDS} \
+      bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${BUILD_TARGETS} ; \
+    bazel shutdown ; true
+
+FROM build-2 AS build-3
+ARG BUILD_TARGETS
+ARG SEGMENT_SECONDS
+ARG BAZEL_FLAGS
+RUN timeout -s INT -k 120 ${SEGMENT_SECONDS} \
+      bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${BUILD_TARGETS} ; \
+    bazel shutdown ; true
+
+FROM build-3 AS build
+ARG BUILD_TARGETS
+ARG BAZEL_FLAGS
+RUN bazel --host_jvm_args=-Xmx2g build -c opt ${BAZEL_FLAGS} ${BUILD_TARGETS}
 
 # Generate licenses file.
 RUN for file in $(find -L bazel-src/external                               \

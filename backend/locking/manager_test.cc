@@ -26,8 +26,13 @@
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
+#include "absl/status/status.h"
 #include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "backend/common/ids.h"
+#include "backend/datamodel/key.h"
+#include "backend/datamodel/key_range.h"
+#include "common/config.h"
 
 namespace google {
 namespace spanner {
@@ -36,157 +41,277 @@ namespace backend {
 
 namespace {
 
+using ::googlesql_base::testing::StatusIs;
+
+// Builds a single-column key from an integer, so tests can carve out disjoint
+// and overlapping point/range locks.
+Key IntKey(int64_t v) { return Key({googlesql::values::Int64(v)}); }
+
 class LockManagerTest : public testing::Test {
  public:
-  LockManagerTest()
-      : request_(LockMode::kExclusive, "table", KeyRange::All(), {}) {}
+  void SetUp() override {
+    saved_probability_ = config::abort_current_transaction_probability();
+  }
+  void TearDown() override {
+    config::set_abort_current_transaction_probability(saved_probability_);
+  }
 
   Clock* clock() { return &clock_; }
   LockManager* manager() { return &manager_; }
-  const LockRequest& request() { return request_; }
+
+  LockRequest ExclusiveAll(const TableID& table = "table") {
+    return LockRequest(LockMode::kExclusive, table, KeyRange::All(), {});
+  }
+  LockRequest SharedAll(const TableID& table = "table") {
+    return LockRequest(LockMode::kShared, table, KeyRange::All(), {});
+  }
+  LockRequest ExclusivePoint(int64_t v, const TableID& table = "table") {
+    return LockRequest(LockMode::kExclusive, table, KeyRange::Point(IntKey(v)),
+                       {});
+  }
+
+  // A handle that cannot be displaced (no abort callback).
+  std::unique_ptr<LockHandle> Handle(int64_t tid, int64_t priority = 1) {
+    return manager()->CreateHandle(TransactionID(tid), /*abort_fn=*/nullptr,
+                                   TransactionPriority(priority));
+  }
+  // A handle whose owning transaction can always be aborted on demand, so a
+  // conflicting requester is able to displace it.
+  std::unique_ptr<LockHandle> DisplaceableHandle(int64_t tid,
+                                                 int64_t priority = 1) {
+    return manager()->CreateHandle(
+        TransactionID(tid), []() -> absl::Status { return absl::OkStatus(); },
+        TransactionPriority(priority));
+  }
 
  private:
   Clock clock_;
   LockManager manager_ = LockManager(&clock_);
-  LockRequest request_;
+  int saved_probability_ = 0;
 };
 
 TEST_F(LockManagerTest, SingleTransactionAcquiresLock) {
-  std::unique_ptr<LockHandle> lh =
-      manager()->CreateHandle(TransactionID(1),
-                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
-  lh->EnqueueLock(request());
+  auto lh = Handle(/*tid=*/1);
+  lh->EnqueueLock(ExclusiveAll());
   EXPECT_FALSE(lh->IsBlocked());
   GOOGLESQL_EXPECT_OK(lh->Wait());
 }
 
-TEST_F(LockManagerTest, ConcurrentTransactionIsAborted) {
-  std::unique_ptr<LockHandle> lh1 =
-      manager()->CreateHandle(TransactionID(1),
-                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
-  std::unique_ptr<LockHandle> lh2 =
-      manager()->CreateHandle(TransactionID(2),
-                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
+TEST_F(LockManagerTest, SameRangeAccessConflicts) {
+  // The emulator does not model shared-read concurrency: a second access to an
+  // overlapping range conflicts even when both are reads. With displacement
+  // off, the second one aborts and retries.
+  config::set_abort_current_transaction_probability(0);
+  auto lh1 = Handle(/*tid=*/1);
+  auto lh2 = Handle(/*tid=*/2);
 
-  // First transaction gets the lock.
-  lh1->EnqueueLock(request());
-  EXPECT_FALSE(lh1->IsBlocked());
-  GOOGLESQL_EXPECT_OK(lh1->Wait());
-  EXPECT_FALSE(lh1->IsBlocked());
-  EXPECT_FALSE(lh1->IsAborted());
-
-  // Second transaction does not get the lock.
-  lh2->EnqueueLock(request());
-  EXPECT_FALSE(lh2->IsBlocked());
-  EXPECT_TRUE(lh2->IsAborted());
-  EXPECT_THAT(lh2->Wait(),
-              googlesql_base::testing::StatusIs(absl::StatusCode::kAborted));
-  EXPECT_TRUE(lh2->IsAborted());
-}
-
-TEST_F(LockManagerTest, SequentialTransactionAcquiresLock) {
-  std::unique_ptr<LockHandle> lh1 =
-      manager()->CreateHandle(TransactionID(1),
-                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
-  std::unique_ptr<LockHandle> lh2 =
-      manager()->CreateHandle(TransactionID(2),
-                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
-  std::unique_ptr<LockHandle> lh3 =
-      manager()->CreateHandle(TransactionID(3),
-                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
-
-  // First transaction gets the lock.
-  lh1->EnqueueLock(request());
+  lh1->EnqueueLock(SharedAll());
   GOOGLESQL_EXPECT_OK(lh1->Wait());
 
-  // Second transaction does not get the lock yet.
-  lh2->EnqueueLock(request());
-  EXPECT_THAT(lh2->Wait(),
-              googlesql_base::testing::StatusIs(absl::StatusCode::kAborted));
-
-  // First transaction unlocks.
-  lh1->UnlockAll();
-
-  // Second transaction is still in a final aborted state.
-  EXPECT_THAT(lh2->Wait(),
-              googlesql_base::testing::StatusIs(absl::StatusCode::kAborted));
-
-  // Now another transaction can get the lock.
-  lh3->EnqueueLock(request());
-  GOOGLESQL_EXPECT_OK(lh3->Wait());
+  lh2->EnqueueLock(SharedAll());
+  EXPECT_TRUE(lh2->IsAborted());
+  EXPECT_THAT(lh2->Wait(), StatusIs(absl::StatusCode::kAborted));
 }
 
-TEST_F(LockManagerTest, TransactionsThatDidNotAcquireLockCanReleaseIt) {
-  std::unique_ptr<LockHandle> lh1 =
-      manager()->CreateHandle(TransactionID(1),
-                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
-  lh1->UnlockAll();
+TEST_F(LockManagerTest, DisjointExclusiveRangesCoexist) {
+  auto lh1 = Handle(/*tid=*/1);
+  auto lh2 = Handle(/*tid=*/2);
 
-  std::unique_ptr<LockHandle> lh2 =
-      manager()->CreateHandle(TransactionID(1),
-                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
-  lh2->EnqueueLock(request());
+  // Two exclusive locks on non-overlapping points run concurrently.
+  lh1->EnqueueLock(ExclusivePoint(1));
+  GOOGLESQL_EXPECT_OK(lh1->Wait());
+
+  lh2->EnqueueLock(ExclusivePoint(2));
   EXPECT_FALSE(lh2->IsBlocked());
+  EXPECT_FALSE(lh2->IsAborted());
   GOOGLESQL_EXPECT_OK(lh2->Wait());
 }
 
-TEST_F(LockManagerTest, EnsuresSerializationWithParallelTransactions) {
-  // Simulate a thread-safe mvcc store with a single key. Even though multiple
-  // threads access this store, they are synchronized by the lock manager.
-  // Concurrent access issues are expected to be caught by tsan.
-  std::map<absl::Time, int> value{{absl::InfinitePast(), 0}};
-  auto SetValue = [&value](absl::Time t, int i) { value[t] = i; };
-  auto GetValue = [&value](absl::Time t) {
-    auto itr = value.upper_bound(t);
-    --itr;
-    return itr->second;
-  };
+TEST_F(LockManagerTest, DifferentTablesDoNotConflict) {
+  auto lh1 = Handle(/*tid=*/1);
+  auto lh2 = Handle(/*tid=*/2);
 
-  // Start n threads each doing a transactional increment k times.
-  int n = 20;
-  int k = 10;
+  lh1->EnqueueLock(ExclusiveAll("table_a"));
+  GOOGLESQL_EXPECT_OK(lh1->Wait());
+
+  lh2->EnqueueLock(ExclusiveAll("table_b"));
+  EXPECT_FALSE(lh2->IsAborted());
+  GOOGLESQL_EXPECT_OK(lh2->Wait());
+}
+
+TEST_F(LockManagerTest, ConflictAbortsRequesterWhenDisplacementDisabled) {
+  // With displacement turned off, a conflicting requester always backs off and
+  // the holder is untouched.
+  config::set_abort_current_transaction_probability(0);
+  auto holder = Handle(/*tid=*/1);
+  auto requester = Handle(/*tid=*/2);
+
+  holder->EnqueueLock(ExclusiveAll());
+  GOOGLESQL_EXPECT_OK(holder->Wait());
+
+  requester->EnqueueLock(ExclusiveAll());
+  EXPECT_FALSE(requester->IsBlocked());
+  EXPECT_TRUE(requester->IsAborted());
+  EXPECT_THAT(requester->Wait(), StatusIs(absl::StatusCode::kAborted));
+  EXPECT_FALSE(holder->IsAborted());
+}
+
+TEST_F(LockManagerTest, RequesterDisplacesHolderWhenConfigured) {
+  // With displacement always on and a displaceable holder, a conflicting
+  // requester takes over and the holder is aborted — never a block.
+  config::set_abort_current_transaction_probability(100);
+  auto holder = DisplaceableHandle(/*tid=*/1);
+  auto requester = Handle(/*tid=*/2);
+
+  holder->EnqueueLock(ExclusiveAll());
+  GOOGLESQL_EXPECT_OK(holder->Wait());
+
+  requester->EnqueueLock(ExclusiveAll());
+  EXPECT_TRUE(holder->IsAborted());
+  EXPECT_FALSE(requester->IsBlocked());
+  GOOGLESQL_EXPECT_OK(requester->Wait());
+}
+
+TEST_F(LockManagerTest, RequesterSucceedsAfterHolderReleases) {
+  config::set_abort_current_transaction_probability(0);
+  auto holder = Handle(/*tid=*/1);
+  auto requester = Handle(/*tid=*/2);
+
+  holder->EnqueueLock(ExclusiveAll());
+  GOOGLESQL_EXPECT_OK(holder->Wait());
+
+  requester->EnqueueLock(ExclusiveAll());
+  EXPECT_THAT(requester->Wait(), StatusIs(absl::StatusCode::kAborted));
+
+  // Once the holder releases and the requester clears its abort (as a real
+  // transaction does on retry via UnlockAll), the retry acquires the lock.
+  holder->UnlockAll();
+  requester->UnlockAll();
+  requester->EnqueueLock(ExclusiveAll());
+  GOOGLESQL_EXPECT_OK(requester->Wait());
+}
+
+TEST_F(LockManagerTest, WholeDatabaseLockDoesNotDisplaceLiveTransaction) {
+  // Even with displacement always on and a displaceable data holder, a schema
+  // change (whole-database lock: empty table id + KeyRange::All()) never
+  // displaces a live transaction — it aborts itself instead, preserving the
+  // emulator's contract that schema changes do not run concurrently with
+  // read-write transactions.
+  config::set_abort_current_transaction_probability(100);
+  auto data = DisplaceableHandle(/*tid=*/2);
+  auto schema = Handle(/*tid=*/1);
+
+  data->EnqueueLock(ExclusivePoint(5, "some_table"));
+  GOOGLESQL_EXPECT_OK(data->Wait());
+
+  schema->EnqueueLock(
+      LockRequest(LockMode::kExclusive, /*table_id=*/"", KeyRange::All(), {}));
+  EXPECT_FALSE(data->IsAborted());
+  EXPECT_THAT(schema->Wait(), StatusIs(absl::StatusCode::kAborted));
+
+  // Once the transaction releases, the whole-database lock is available.
+  data->UnlockAll();
+  schema->UnlockAll();
+  schema->EnqueueLock(
+      LockRequest(LockMode::kExclusive, /*table_id=*/"", KeyRange::All(), {}));
+  GOOGLESQL_EXPECT_OK(schema->Wait());
+}
+
+TEST_F(LockManagerTest, CommitTimestampsAreStrictlyIncreasing) {
+  auto lh1 = Handle(/*tid=*/1);
+  auto lh2 = Handle(/*tid=*/2);
+
+  auto t1 = lh1->ReserveCommitTimestamp();
+  GOOGLESQL_ASSERT_OK(t1);
+  auto t2 = lh2->ReserveCommitTimestamp();
+  GOOGLESQL_ASSERT_OK(t2);
+  EXPECT_LT(*t1, *t2);
+
+  GOOGLESQL_EXPECT_OK(lh1->MarkCommitted());
+  GOOGLESQL_EXPECT_OK(lh2->MarkCommitted());
+  EXPECT_EQ(manager()->LastCommitTimestamp(), *t2);
+}
+
+TEST_F(LockManagerTest, DisjointTransactionsRunInParallel) {
+  // Each thread transactionally increments its own dedicated key. Because the
+  // keys are disjoint, the transactions take non-conflicting exclusive locks
+  // and make progress concurrently (no aborts, no serialization). tsan is
+  // expected to catch any synchronization bug.
+  const int n = 16;
+  const int k = 25;
+  std::vector<std::atomic<int>> counters(n);
   std::vector<std::thread> threads;
   std::atomic<int> id_counter(0);
+
   for (int i = 0; i < n; ++i) {
     threads.emplace_back(
-        [&](int i) {
+        [&](int key) {
           for (int j = 0; j < k; ++j) {
-            while (true) {
-              // Get a lock.
-              std::unique_ptr<LockHandle> lh = manager()->CreateHandle(
-                  TransactionID(++id_counter),
-                  /*try_abort_fn=*/nullptr, TransactionPriority(1));
-              lh->EnqueueLock(request());
-              absl::Status status = lh->Wait();
-
-              // Retry on aborts.
-              if (status.code() == absl::StatusCode::kAborted) {
-                continue;
-              } else {
-                GOOGLESQL_ASSERT_OK(status);
-              }
-
-              // We got the lock, increment the counter.
-              int cur_value = GetValue(absl::InfiniteFuture());
-              int new_value = cur_value + 1;
-              SetValue(clock()->Now(), new_value);
-
-              // Unlock the lock.
-              lh->UnlockAll();
-              break;
-            }
+            auto lh = manager()->CreateHandle(
+                TransactionID(++id_counter), /*abort_fn=*/nullptr,
+                TransactionPriority(1));
+            lh->EnqueueLock(LockRequest(LockMode::kExclusive, "table",
+                                        KeyRange::Point(IntKey(key)), {}));
+            GOOGLESQL_ASSERT_OK(lh->Wait());
+            counters[key].fetch_add(1);
+            lh->UnlockAll();
           }
         },
         i);
   }
-
-  // Wait for all threads to complete.
   for (std::thread& thread : threads) {
     thread.join();
   }
+  for (int i = 0; i < n; ++i) {
+    EXPECT_EQ(counters[i].load(), k);
+  }
+}
 
-  // Expect that the counter was incremented n*k times.
-  EXPECT_EQ(n * k, GetValue(absl::InfiniteFuture()));
+TEST_F(LockManagerTest, ContendedTransactionsSerializeAndConverge) {
+  // All threads contend on the same key. With displacement off, a conflicting
+  // requester aborts and retries while the holder keeps its lock until it
+  // releases — every increment must still land without deadlock or lost
+  // updates.
+  config::set_abort_current_transaction_probability(0);
+  std::map<absl::Time, int> value{{absl::InfinitePast(), 0}};
+  auto GetValue = [&value] { return value.rbegin()->second; };
+
+  const int n = 16;
+  const int k = 25;
+  std::vector<std::thread> threads;
+  std::atomic<int> id_counter(0);
+  absl::Mutex store_mu;
+
+  for (int i = 0; i < n; ++i) {
+    threads.emplace_back([&] {
+      for (int j = 0; j < k; ++j) {
+        while (true) {
+          auto lh = manager()->CreateHandle(TransactionID(++id_counter),
+                                            /*abort_fn=*/nullptr,
+                                            TransactionPriority(1));
+          lh->EnqueueLock(
+              LockRequest(LockMode::kExclusive, "table", KeyRange::All(), {}));
+          absl::Status status = lh->Wait();
+          if (status.code() == absl::StatusCode::kAborted) {
+            lh->UnlockAll();  // Release and retry, mirroring Reset().
+            continue;
+          }
+          GOOGLESQL_ASSERT_OK(status);
+          {
+            absl::MutexLock l(&store_mu);
+            int next = GetValue() + 1;
+            value[clock()->Now()] = next;
+          }
+          lh->UnlockAll();
+          break;
+        }
+      }
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(n * k, GetValue());
 }
 
 }  // namespace

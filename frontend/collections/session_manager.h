@@ -17,7 +17,12 @@
 #ifndef STORAGE_CLOUD_SPANNER_EMULATOR_FRONTEND_SESSION_MANAGER_H_
 #define STORAGE_CLOUD_SPANNER_EMULATOR_FRONTEND_SESSION_MANAGER_H_
 
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <map>
 #include <memory>
+#include <string>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
@@ -43,39 +48,55 @@ class SessionManager {
   absl::StatusOr<std::shared_ptr<Session>> CreateSession(
       const Labels& labels, bool multiplexed,
       std::shared_ptr<Database> database,
-      MultiplexedSessionTransactionManager* mux_txn_manager)
-      ABSL_LOCKS_EXCLUDED(mu_);
+      MultiplexedSessionTransactionManager* mux_txn_manager);
 
   // Returns a session with the given URI.
   absl::StatusOr<std::shared_ptr<Session>> GetSession(
-      const std::string& session_uri) ABSL_LOCKS_EXCLUDED(mu_);
+      const std::string& session_uri);
 
   // Deletes a session with the given URI.
   absl::Status DeleteSession(const std::string& session_uri,
-                             bool delete_multiplex_sessions = false)
-      ABSL_LOCKS_EXCLUDED(mu_);
+                             bool delete_multiplex_sessions = false);
 
   // Lists sessions attached to the given database URI.
   absl::StatusOr<std::vector<std::shared_ptr<Session>>> ListSessions(
       const std::string& database_uri,
-      bool include_multiplex_sessions = false) const ABSL_LOCKS_EXCLUDED(mu_);
+      bool include_multiplex_sessions = false) const;
 
-  bool IsMultiplexedSession(const std::string& session_uri) const
-      ABSL_LOCKS_EXCLUDED(mu_);
+  bool IsMultiplexedSession(const std::string& session_uri) const;
 
  private:
+  // The session map is sharded by session URI so that concurrent requests on
+  // unrelated sessions (the common case: many parallel databases, each with its
+  // own sessions) do not serialize on a single process-global mutex. Every RPC
+  // resolves its session through GetSession, so this lock sits on the hottest
+  // path in the server; sharding it lets independent databases run in parallel.
+  static constexpr size_t kNumShards = 64;
+
+  struct Shard {
+    mutable absl::Mutex mu;
+    std::map<std::string, std::shared_ptr<Session>> session_map ABSL_GUARDED_BY(mu);
+  };
+
+  // Routes a session URI to its shard. Session URIs already embed a densely
+  // incrementing id, so a cheap string hash spreads them evenly across shards.
+  Shard& ShardFor(const std::string& session_uri) {
+    return shards_[std::hash<std::string>{}(session_uri) & (kNumShards - 1)];
+  }
+  const Shard& ShardFor(const std::string& session_uri) const {
+    return shards_[std::hash<std::string>{}(session_uri) & (kNumShards - 1)];
+  }
+
   // System-wide clock.
   Clock* clock_;
 
-  // Mutex to guard state below.
-  mutable absl::Mutex mu_;
+  // Counter for session ids. Atomic so CreateSession never needs a global lock
+  // just to mint the next id.
+  std::atomic<int> next_session_id_ = 0;
 
-  // Counter for session ids.
-  int next_session_id_ ABSL_GUARDED_BY(mu_) = 0;
-
-  // Map from session URI to session objects.
-  std::map<std::string, std::shared_ptr<Session>> session_map_
-      ABSL_GUARDED_BY(mu_);
+  // Sharded session storage. kNumShards is a power of two so the shard index is
+  // a mask, not a modulo.
+  mutable std::array<Shard, kNumShards> shards_;
 };
 
 }  // namespace frontend

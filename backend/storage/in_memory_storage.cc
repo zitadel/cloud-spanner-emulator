@@ -16,6 +16,10 @@
 
 #include "backend/storage/in_memory_storage.h"
 
+#include <cstdio>
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+
 #include <memory>
 #include <utility>
 #include <vector>
@@ -82,7 +86,10 @@ absl::Status InMemoryStorage::Lookup(
     absl::Time timestamp, const TableID& table_id, const Key& key,
     const std::vector<ColumnID>& column_ids,
     std::vector<googlesql::Value>* values) const {
-  absl::MutexLock lock(mu_);
+  // Reads take a shared lock so they run concurrently across threads; only the
+  // mutating paths (Write/Delete/cleanup) take the lock exclusively. This is
+  // safe because Lookup/Read are const and never modify tables_.
+  absl::ReaderMutexLock lock(mu_);
 
   // Validate the request.
   if (!column_ids.empty() && values == nullptr) {
@@ -141,7 +148,8 @@ absl::Status InMemoryStorage::Read(
     absl::Time timestamp, const TableID& table_id, const KeyRange& key_range,
     const std::vector<ColumnID>& column_ids,
     std::unique_ptr<StorageIterator>* itr) const {
-  absl::MutexLock lock(mu_);
+  // Shared lock: concurrent range reads run in parallel (see Lookup).
+  absl::ReaderMutexLock lock(mu_);
 
   // Validate the request.
   if (!key_range.IsClosedOpen()) {

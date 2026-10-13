@@ -17,6 +17,7 @@
 #include "common/clock.h"
 
 #include <algorithm>
+#include <cstdint>
 
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -27,29 +28,24 @@ namespace emulator {
 
 namespace {
 
-// Returns the current time at microsecond granularity.
-absl::Time NowMicros() {
-  return absl::FromUnixMicros(absl::ToUnixMicros(absl::Now()));
-}
+// Returns the current time at microsecond granularity, since the Unix epoch.
+int64_t NowMicros() { return absl::ToUnixMicros(absl::Now()); }
 
 }  // namespace
 
-Clock::Clock()
-    : last_system_time_(NowMicros()), last_dispensed_time_(last_system_time_) {}
+Clock::Clock() : last_dispensed_micros_(NowMicros()) {}
 
 absl::Time Clock::Now() {
-  absl::MutexLock lock(mu_);
-
-  // Follows the system clock, and steps one microsecond past the last value
-  // only while the system clock has not moved beyond it. Adding the elapsed
-  // system time to the last value instead keeps every such step for good, and
-  // a strong read waits for the system clock to reach its read timestamp.
-  absl::Time now = NowMicros();
-  last_system_time_ = now;
-  last_dispensed_time_ =
-      std::max(now, last_dispensed_time_ + absl::Microseconds(1));
-
-  return last_dispensed_time_;
+  const int64_t now = NowMicros();
+  int64_t prev = last_dispensed_micros_.load(std::memory_order_relaxed);
+  int64_t next;
+  do {
+    // Strictly monotonic: never hand out a value already dispensed, and track
+    // the wall clock when it has advanced past the last value.
+    next = std::max(now, prev + 1);
+  } while (!last_dispensed_micros_.compare_exchange_weak(
+      prev, next, std::memory_order_relaxed));
+  return absl::FromUnixMicros(next);
 }
 
 }  // namespace emulator

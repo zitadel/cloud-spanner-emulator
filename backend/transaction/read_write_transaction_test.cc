@@ -293,37 +293,31 @@ TEST_F(ReadWriteTransactionTest, CommitWithMultipleChangesToDatabase) {
 }
 
 TEST_F(ReadWriteTransactionTest,
-       ConcurrentReadWriteTransactionsReturnsAborted) {
-  auto current_probability = config::abort_current_transaction_probability();
-  config::set_abort_current_transaction_probability(0);
-  // Started "writes" on first transaction.
+       ConcurrentDisjointWritesCommitIndependently) {
+  // With range-based locking, two read-write transactions that write disjoint
+  // rows take non-overlapping exclusive locks and run concurrently: neither is
+  // aborted, and both commit. (The old emulator serialized every read-write
+  // transaction behind one whole-database lock, so the second write here used
+  // to abort until the first committed.)
   Mutation m1;
   m1.AddWriteOp(MutationOpType::kInsert, "test_table",
                 {"int64_col", "string_col"}, {{Int64(1), String("value-1")}});
-
-  auto txn1 = CreateReadWriteTransaction();
-  GOOGLESQL_EXPECT_OK(txn1->Write(m1));
-
-  // Before commiting first transaction, starting another transaction is in
-  // progress. Write for second transaction should consistently ABORT.
-  auto txn2 = CreateReadWriteTransaction();
   Mutation m2;
   m2.AddWriteOp(MutationOpType::kInsert, "test_table",
                 {"int64_col", "string_col"}, {{Int64(2), String("value-2")}});
-  for (int i = 0; i < 5; i++) {
-    EXPECT_THAT(txn2->Write(m2), StatusIs(absl::StatusCode::kAborted));
-  }
 
-  // Commit the first transaction.
-  GOOGLESQL_EXPECT_OK(txn1->Commit());
-  EXPECT_EQ(txn1->state(), ReadWriteTransaction::State::kCommitted);
+  auto txn1 = CreateReadWriteTransaction();
+  auto txn2 = CreateReadWriteTransaction();
 
-  // Now, secondary transaction can write / commit.
+  // Both transactions are open at the same time and each writes its own row.
+  GOOGLESQL_EXPECT_OK(txn1->Write(m1));
   GOOGLESQL_EXPECT_OK(txn2->Write(m2));
-  GOOGLESQL_EXPECT_OK(txn2->Commit());
-  EXPECT_EQ(txn2->state(), ReadWriteTransaction::State::kCommitted);
 
-  config::set_abort_current_transaction_probability(current_probability);
+  // Both commit without either having to wait for the other.
+  GOOGLESQL_EXPECT_OK(txn1->Commit());
+  GOOGLESQL_EXPECT_OK(txn2->Commit());
+  EXPECT_EQ(txn1->state(), ReadWriteTransaction::State::kCommitted);
+  EXPECT_EQ(txn2->state(), ReadWriteTransaction::State::kCommitted);
 }
 
 TEST_F(ReadWriteTransactionTest, ConcurrentTransactionsEventuallySucceed) {

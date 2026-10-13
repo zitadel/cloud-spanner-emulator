@@ -1,0 +1,117 @@
+name: Build and publish the emulator image
+description: >
+  Builds the image one stage at a time, keeping each stage's layers in the
+  registry so a later attempt continues from them, then publishes and tests it.
+inputs:
+  image:
+    description: Image name, without a tag.
+    required: true
+  token:
+    description: Token with permission to write the package.
+    required: true
+  rehearsal:
+    description: Build a tiny target and do not publish; checks the pipeline itself.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        large-packages: true
+        # Keep the swap file: running out of memory should slow the build down,
+        # not freeze the runner.
+        swap-storage: false
+        docker-images: false
+
+    - uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ inputs.token }}
+
+    # Fail in the first minute, not after the compile, if this workflow cannot
+    # publish to the package. It also creates the package linked to this repository.
+    - name: Check that this workflow can publish to GHCR
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: |
+        printf 'FROM alpine:3.20\nLABEL org.opencontainers.image.source=%s\n' \
+          "${{ github.server_url }}/${{ github.repository }}" \
+          | docker buildx build --push -t "$IMAGE:ci-probe" -
+
+    - name: Image metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ inputs.image }}
+        tags: |
+          type=raw,value=perf,enable=${{ github.ref_type == 'branch' }}
+          type=sha,format=long
+          type=ref,event=tag
+
+    # Each stage is built by its own invocation and exports its layers as soon as
+    # it is done. A runner that dies part-way therefore loses at most the stage it
+    # was in, and the next attempt starts from the layers already in the registry.
+    - name: Build the stages one at a time
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        REHEARSAL: ${{ inputs.rehearsal }}
+      run: |
+        set -euo pipefail
+        args=()
+        if [ "$REHEARSAL" = true ]; then
+          args+=(--build-arg DEPS_TARGETS=@com_google_absl//absl/strings
+                 --build-arg BUILD_TARGETS=//common:clock
+                 --build-arg SEGMENT_SECONDS=60)
+        fi
+        for stage in deps-1 deps-2 deps-3 deps-4 deps-5 deps build-1 build-2 build-3 build; do
+          echo "::group::$stage ($(date -u +%H:%M:%S))"
+          docker buildx build -f build/docker/Dockerfile.ubuntu \
+            --target "$stage" --platform linux/amd64 "${args[@]}" \
+            --cache-from "type=registry,ref=$IMAGE:buildcache" \
+            --cache-to "type=registry,ref=$IMAGE:buildcache,mode=max,ignore-error=true" \
+            .
+          free -m | sed -n 1,2p
+          df -h / | tail -1
+          echo "::endgroup::"
+        done
+
+    - name: Build and push the image
+      if: ${{ inputs.rehearsal != 'true' }}
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: build/docker/Dockerfile.ubuntu
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=registry,ref=${{ inputs.image }}:buildcache
+
+    # The image is only as good as its first start: run what was published.
+    - name: Smoke test the published image
+      if: ${{ inputs.rehearsal != 'true' }}
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: |
+        docker run -d --name emulator -p 9010:9010 -p 9020:9020 \
+          "$IMAGE:sha-${{ github.sha }}"
+        for i in $(seq 1 60); do
+          if (echo > /dev/tcp/127.0.0.1/9010) 2>/dev/null; then
+            echo "emulator is listening on 9010"
+            docker logs emulator 2>&1 | tail -5
+            exit 0
+          fi
+          sleep 1
+        done
+        docker logs emulator 2>&1 | tail -30
+        echo "emulator did not start listening on 9010" >&2
+        exit 1
