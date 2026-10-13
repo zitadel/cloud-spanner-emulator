@@ -1370,7 +1370,16 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
                    MakeAnalyzerOptionsWithParameters(
                        normalized_query.declared_params,
                        GetTimeZone(function_catalog_.GetLatestSchema())));
-  analyzer_options.set_prune_unused_columns(true);
+  // DML needs every column available for the write, so it must be analyzed with
+  // column pruning off. Historically this path always analyzed with pruning on,
+  // then (for DML) discarded that analysis and analyzed a second time with
+  // pruning off. Decide up front from the cheap SQL-text heuristic so DML is
+  // analyzed once, with the right options, saving a full parse/analyze and its
+  // AST allocation per DML statement. If the heuristic disagrees with the
+  // resolved statement kind, the DML path below still re-analyzes, so this is
+  // only an optimization, never a correctness change.
+  const bool likely_dml = IsDMLQuery(normalized_query.sql);
+  analyzer_options.set_prune_unused_columns(!likely_dml);
 
   QueryEvaluatorForEngine view_evaluator(*this, context,
                                          normalized_query.secure_context);
@@ -1435,21 +1444,26 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
     result.rows = std::move(cursor);
   } else {
     GOOGLESQL_RET_CHECK_NE(context.writer, nullptr);
-    analyzer_options.set_prune_unused_columns(false);
-    if (context.schema->dialect() ==
-        database_api::DatabaseDialect::POSTGRESQL) {
-      GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
-                       AnalyzePostgreSQL(normalized_query.sql, catalog.get(),
-                                         analyzer_options, type_factory_,
-                                         &function_catalog_));
-    } else {
-      GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
-                       Analyze(normalized_query.sql, catalog.get(),
-                               analyzer_options, type_factory_));
+    // DML must be analyzed with column pruning off. If the up-front heuristic
+    // already selected that (the common case), reuse the analysis done above;
+    // only re-analyze when pruning was left on (heuristic predicted non-DML).
+    if (analyzer_options.prune_unused_columns()) {
+      analyzer_options.set_prune_unused_columns(false);
+      if (context.schema->dialect() ==
+          database_api::DatabaseDialect::POSTGRESQL) {
+        GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
+                         AnalyzePostgreSQL(normalized_query.sql, catalog.get(),
+                                           analyzer_options, type_factory_,
+                                           &function_catalog_));
+      } else {
+        GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
+                         Analyze(normalized_query.sql, catalog.get(),
+                                 analyzer_options, type_factory_));
+      }
+      GOOGLESQL_ASSIGN_OR_RETURN(resolved_statement,
+                       ExtractValidatedResolvedStatementAndOptions(
+                           analyzer_output.get(), context, catalog.get()));
     }
-    GOOGLESQL_ASSIGN_OR_RETURN(resolved_statement,
-                     ExtractValidatedResolvedStatementAndOptions(
-                         analyzer_output.get(), context, catalog.get()));
 
     // Only execute the SQL statement if the user did not request PLAN mode.
     if (query_mode != v1::ExecuteSqlRequest::PLAN) {
@@ -1613,7 +1627,7 @@ bool IsDMLQuery(const std::string& query) {
 absl::StatusOr<ChangeStreamQueryValidator::ChangeStreamMetadata>
 QueryEngine::TryGetChangeStreamMetadata(const Query& query,
                                         const Schema* schema,
-                                        bool in_read_write_txn) {
+                                        bool in_read_write_txn) const {
   const absl::Time start_time = absl::Now();
   Query local_query;
   NormalizeParameterNames(schema, query, &local_query);
@@ -1621,19 +1635,21 @@ QueryEngine::TryGetChangeStreamMetadata(const Query& query,
                    MakeAnalyzerOptionsWithParameters(
                        local_query.declared_params, GetTimeZone(schema)));
   analyzer_options.set_prune_unused_columns(true);
-  googlesql::TypeFactory type_factory;
-  FunctionCatalog function_catalog(
-      &type_factory, kCloudSpannerEmulatorFunctionCatalogName, schema);
-  Catalog catalog{schema, &function_catalog, &type_factory, analyzer_options};
+  // Reuse the engine's persistent TypeFactory and FunctionCatalog rather than
+  // constructing a fresh FunctionCatalog (the full builtin function set) on
+  // every call. function_catalog_ is used read-only here, exactly as the normal
+  // ExecuteSql path uses it for concurrent queries.
+  googlesql::TypeFactory* type_factory = type_factory_;
+  Catalog catalog{schema, &function_catalog_, type_factory, analyzer_options};
   std::unique_ptr<const googlesql::AnalyzerOutput> analyzer_output;
   if (schema->dialect() == database_api::DatabaseDialect::POSTGRESQL) {
     GOOGLESQL_ASSIGN_OR_RETURN(
         analyzer_output,
         AnalyzePostgreSQL(local_query.sql, &catalog, analyzer_options,
-                          &type_factory, &function_catalog));
+                          type_factory, &function_catalog_));
   } else {
     GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output, Analyze(local_query.sql, &catalog,
-                                              analyzer_options, &type_factory));
+                                              analyzer_options, type_factory));
   }
 
   GOOGLESQL_ASSIGN_OR_RETURN(auto params,

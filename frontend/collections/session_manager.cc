@@ -43,7 +43,7 @@ absl::StatusOr<std::shared_ptr<Session>> SessionManager::CreateSession(
     const Labels& labels, const bool multiplexed,
     std::shared_ptr<Database> database,
     MultiplexedSessionTransactionManager* mux_txn_manager) {
-  absl::MutexLock lock(mu_);
+  // Mint the id without a lock; only the single shard is locked for insertion.
   const std::string session_id = absl::StrCat(next_session_id_++);
   std::string session_uri =
       MakeSessionUri(database->database_uri(), session_id);
@@ -54,15 +54,18 @@ absl::StatusOr<std::shared_ptr<Session>> SessionManager::CreateSession(
 
   // Need to also cache mux session since the session IDs generated are not
   // from Tokens but rather just an incrementing value.
-  session_map_[session_uri] = session;
+  Shard& shard = ShardFor(session_uri);
+  absl::MutexLock lock(shard.mu);
+  shard.session_map[session_uri] = session;
   return session;
 }
 
 absl::StatusOr<std::shared_ptr<Session>> SessionManager::GetSession(
     const std::string& session_uri) {
-  absl::MutexLock lock(mu_);
-  auto itr = session_map_.find(session_uri);
-  if (itr == session_map_.end()) {
+  Shard& shard = ShardFor(session_uri);
+  absl::MutexLock lock(shard.mu);
+  auto itr = shard.session_map.find(session_uri);
+  if (itr == shard.session_map.end()) {
     return error::SessionNotFound(session_uri);
   }
   std::shared_ptr<Session> session = itr->second;
@@ -71,7 +74,7 @@ absl::StatusOr<std::shared_ptr<Session>> SessionManager::GetSession(
   if (clock_->Now() - session->approximate_last_use_time() >
       expiration_duration) {
     // Delete inactive sessions after expiration duration.
-    session_map_.erase(session_uri);
+    shard.session_map.erase(session_uri);
     return error::SessionNotFound(session_uri);
   }
   session->set_approximate_last_use_time(clock_->Now());
@@ -81,12 +84,18 @@ absl::StatusOr<std::shared_ptr<Session>> SessionManager::GetSession(
 absl::StatusOr<std::vector<std::shared_ptr<Session>>>
 SessionManager::ListSessions(const std::string& database_uri,
                              bool include_multiplex_sessions) const {
-  absl::MutexLock lock(mu_);
+  // ListSessions is a cold administrative path, so scanning every shard is fine.
+  // Each shard is locked independently and briefly; the result is a consistent
+  // enough snapshot for listing purposes.
   std::string session_uri_prefix = absl::StrCat(database_uri, "/");
   std::vector<std::shared_ptr<Session>> sessions;
-  for (auto itr = session_map_.lower_bound(session_uri_prefix);
-       itr != session_map_.end(); ++itr) {
-    if (absl::StartsWith(itr->first, session_uri_prefix)) {
+  for (const Shard& shard : shards_) {
+    absl::MutexLock lock(shard.mu);
+    for (auto itr = shard.session_map.lower_bound(session_uri_prefix);
+         itr != shard.session_map.end(); ++itr) {
+      if (!absl::StartsWith(itr->first, session_uri_prefix)) {
+        break;
+      }
       std::shared_ptr<Session> session = itr->second;
       if (session->multiplexed() && !include_multiplex_sessions) {
         // Multiplexed sessions are not sent in ListSessions response by
@@ -101,8 +110,6 @@ SessionManager::ListSessions(const std::string& database_uri,
           (session->multiplexed() && include_multiplex_sessions)) {
         sessions.push_back(session);
       }
-    } else {
-      return sessions;
     }
   }
   return sessions;
@@ -110,9 +117,10 @@ SessionManager::ListSessions(const std::string& database_uri,
 
 absl::Status SessionManager::DeleteSession(const std::string& session_uri,
                                            bool delete_multiplex_sessions) {
-  absl::MutexLock lock(mu_);
-  auto itr = session_map_.find(session_uri);
-  if (itr != session_map_.end()) {
+  Shard& shard = ShardFor(session_uri);
+  absl::MutexLock lock(shard.mu);
+  auto itr = shard.session_map.find(session_uri);
+  if (itr != shard.session_map.end()) {
     std::shared_ptr<Session> session = itr->second;
     // Multiplexed sessions cannot be deleted using DeleteSession API, but they
     // need to be deleted when the database is dropped.
@@ -120,7 +128,7 @@ absl::Status SessionManager::DeleteSession(const std::string& session_uri,
       return error::InvalidOperationSessionDelete();
     }
   }
-  session_map_.erase(session_uri);
+  shard.session_map.erase(session_uri);
   return absl::OkStatus();
 }
 

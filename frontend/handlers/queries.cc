@@ -28,9 +28,12 @@
 #include "google/spanner/v1/spanner.pb.h"
 #include "google/spanner/v1/transaction.pb.h"
 #include "googlesql/public/analyzer_options.h"
+#include <cstdio>
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/cord.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "absl/types/variant.h"
 #include "backend/access/read.h"
@@ -476,7 +479,7 @@ absl::Status ExecuteStreamingSql(
                 request->request_options().client_context().secure_context()));
         bool in_read_write_txn = txn->IsReadWrite() || txn->IsPartitionedDml();
         GOOGLESQL_ASSIGN_OR_RETURN(change_stream_metadata,
-                         backend::QueryEngine::TryGetChangeStreamMetadata(
+                         txn->query_engine()->TryGetChangeStreamMetadata(
                              query, txn->schema(), in_read_write_txn));
         // if current query is a change stream query, return and exit current
         // transaction lambda to avoid nested transaction call.

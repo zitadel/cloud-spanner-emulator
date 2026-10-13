@@ -17,7 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_CLOCK_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_COMMON_CLOCK_H_
 
-#include "absl/synchronization/mutex.h"
+#include <atomic>
+#include <cstdint>
+
 #include "absl/time/time.h"
 
 namespace google {
@@ -37,23 +39,21 @@ namespace emulator {
 //   This is to conform with Cloud Spanner's commit timestamps which also
 //   operate at microsecond resolution.
 //
-// This class is thread safe.
+// This class is thread safe and lock-free: `Now()` dispenses strictly
+// increasing microsecond timestamps with a single atomic compare-exchange, so
+// transactions across every database can take commit timestamps concurrently
+// without serializing on a global mutex.
 class Clock {
  public:
   Clock();
 
   // Returns the current time.
-  absl::Time Now() ABSL_LOCKS_EXCLUDED(mu_);
+  absl::Time Now();
 
  private:
-  // Mutex to guard state below.
-  absl::Mutex mu_;
-
-  // The last value we got from the system clock.
-  absl::Time last_system_time_ ABSL_GUARDED_BY(mu_);
-
-  // The last value we handed out in a call to Clock::Now().
-  absl::Time last_dispensed_time_ ABSL_GUARDED_BY(mu_);
+  // The last microsecond value handed out by Now(), as microseconds since the
+  // Unix epoch. Updated with a lock-free compare-exchange.
+  std::atomic<int64_t> last_dispensed_micros_;
 };
 
 }  // namespace emulator
