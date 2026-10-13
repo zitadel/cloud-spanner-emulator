@@ -1,0 +1,40 @@
+name: build-emulator-image
+on:
+  workflow_dispatch:
+  push:
+    branches: [perf/range-locking-and-hot-path]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          large-packages: true
+          swap-storage: true
+          docker-images: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/cloud-spanner-emulator:perf
+            ghcr.io/${{ github.repository_owner }}/cloud-spanner-emulator:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
