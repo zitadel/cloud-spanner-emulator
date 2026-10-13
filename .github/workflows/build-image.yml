@@ -2,17 +2,19 @@ name: build-emulator-image
 
 # Builds the emulator as a linux/amd64 image and publishes it to GHCR.
 #
-# A cold build compiles GoogleSQL, which takes hours, so the build is done in two
-# steps that share a layer cache kept in the registry:
+# A cold build compiles GoogleSQL and takes hours on a 4-vCPU runner, and a
+# runner can die part-way. So the Dockerfile builds in time-boxed stages and CI
+# keeps each stage's layers in the registry (see .github/actions/build-and-publish).
+# This workflow then runs up to four attempts one after another, each on a fresh
+# runner that carries on from the layers already saved; the run is green if any
+# attempt publishes the image, and red only if all of them fail.
 #
-#   1. the `deps` stage (toolchain + prebuilt GoogleSQL), cached as soon as it
-#      finishes, so a run that later runs out of time keeps that work;
-#   2. the emulator itself, which starts from the cached `deps` layers.
+# A push to a branch named perf/smoke-* rehearses the whole pipeline on a tiny
+# target and publishes nothing.
 #
-# The cache lives in GHCR rather than the Actions cache, which is capped at 10 GB
-# per repository and evicts a GoogleSQL build.
+# (Re-dispatching the workflow would be simpler, but GitHub only dispatches
+# workflows that exist on the default branch.)
 on:
-  workflow_dispatch:
   push:
     branches: ['perf/**']
     tags: ['v*']
@@ -29,88 +31,91 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/cloud-spanner-emulator
+  REHEARSAL: ${{ startsWith(github.ref_name, 'perf/smoke') }}
 
 jobs:
-  build:
+  attempt-1:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 350
+    continue-on-error: true
+    outputs:
+      built: ${{ steps.done.outputs.built }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+      - uses: ./.github/actions/build-and-publish
         with:
-          tool-cache: true
-          large-packages: true
-          swap-storage: true
-          docker-images: false
+          image: ${{ env.IMAGE }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          rehearsal: ${{ env.REHEARSAL }}
+      - id: done
+        run: echo "built=true" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+  attempt-2:
+    needs: attempt-1
+    if: ${{ always() && needs.attempt-1.outputs.built != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    continue-on-error: true
+    outputs:
+      built: ${{ steps.done.outputs.built }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-and-publish
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          image: ${{ env.IMAGE }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          rehearsal: ${{ env.REHEARSAL }}
+      - id: done
+        run: echo "built=true" >> "$GITHUB_OUTPUT"
 
-      # Fail in the first minute, not after the compile, if this workflow cannot
-      # publish to the package (for instance when the organisation restricts who
-      # may create packages). It also creates the package already linked to this
-      # repository.
-      - name: Check that this workflow can publish to GHCR
-        run: |
-          printf 'FROM alpine:3.20\nLABEL org.opencontainers.image.source=%s\n' \
-            "${{ github.server_url }}/${{ github.repository }}" \
-            | docker buildx build --push -t "$IMAGE:ci-probe" -
-
-      # Tags and labels. The source label links the package to this repository, so
-      # it takes this repository's visibility and permissions.
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@v5
+  attempt-3:
+    needs: [attempt-1, attempt-2]
+    if: ${{ always() && needs.attempt-1.outputs.built != 'true' && needs.attempt-2.outputs.built != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    continue-on-error: true
+    outputs:
+      built: ${{ steps.done.outputs.built }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-and-publish
         with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=perf,enable=${{ github.ref_type == 'branch' }}
-            type=sha,format=long
-            type=ref,event=tag
+          image: ${{ env.IMAGE }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          rehearsal: ${{ env.REHEARSAL }}
+      - id: done
+        run: echo "built=true" >> "$GITHUB_OUTPUT"
 
-      - name: Build and cache the dependency stage
-        uses: docker/build-push-action@v6
+  attempt-4:
+    needs: [attempt-1, attempt-2, attempt-3]
+    if: ${{ always() && needs.attempt-1.outputs.built != 'true' && needs.attempt-2.outputs.built != 'true' && needs.attempt-3.outputs.built != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    continue-on-error: true
+    outputs:
+      built: ${{ steps.done.outputs.built }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-and-publish
         with:
-          context: .
-          file: build/docker/Dockerfile.ubuntu
-          target: deps
-          platforms: linux/amd64
-          push: false
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max,ignore-error=true
+          image: ${{ env.IMAGE }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          rehearsal: ${{ env.REHEARSAL }}
+      - id: done
+        run: echo "built=true" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push the image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: build/docker/Dockerfile.ubuntu
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-
-      # The image is only as good as its first start: run what was published.
-      - name: Smoke test the published image
-        run: |
-          docker run -d --name emulator -p 9010:9010 -p 9020:9020 \
-            "$IMAGE:sha-${{ github.sha }}"
-          for i in $(seq 1 60); do
-            if (echo > /dev/tcp/127.0.0.1/9010) 2>/dev/null; then
-              echo "emulator is listening on 9010"
-              docker logs emulator 2>&1 | tail -5
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs emulator 2>&1 | tail -30
-          echo "emulator did not start listening on 9010" >&2
-          exit 1
+  # The verdict. The attempts above never fail the run themselves, so this is
+  # what turns it red when none of them produced an image.
+  result:
+    needs: [attempt-1, attempt-2, attempt-3, attempt-4]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: |
+          built="${{ needs.attempt-1.outputs.built }}${{ needs.attempt-2.outputs.built }}${{ needs.attempt-3.outputs.built }}${{ needs.attempt-4.outputs.built }}"
+          if [ -z "$built" ]; then
+            echo "no attempt produced the image" >&2
+            exit 1
+          fi
+          echo "image built and published"
