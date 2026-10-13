@@ -10,7 +10,8 @@ name: build-emulator-image
 # attempt publishes the image, and red only if all of them fail.
 #
 # A push to a branch named perf/smoke-* rehearses the whole pipeline on a tiny
-# target and publishes nothing.
+# target and publishes nothing; perf/smoke-retry* also fails the first attempt on
+# purpose, to check that the next one continues from it.
 #
 # (Re-dispatching the workflow would be simpler, but GitHub only dispatches
 # workflows that exist on the default branch.)
@@ -47,6 +48,13 @@ jobs:
           image: ${{ env.IMAGE }}
           token: ${{ secrets.GITHUB_TOKEN }}
           rehearsal: ${{ env.REHEARSAL }}
+      # Rehearsal only (branches named perf/smoke-retry*): fail this attempt after
+      # its work is saved, to check that the next attempt carries on from it.
+      - name: Rehearsal - simulate a failed attempt
+        if: ${{ startsWith(github.ref_name, 'perf/smoke-retry') }}
+        run: |
+          echo "failing on purpose to exercise the next attempt" >&2
+          exit 1
       - id: done
         run: echo "built=true" >> "$GITHUB_OUTPUT"
 
