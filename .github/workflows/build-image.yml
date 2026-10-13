@@ -1,17 +1,42 @@
 name: build-emulator-image
+
+# Builds the emulator as a linux/amd64 image and publishes it to GHCR.
+#
+# A cold build compiles GoogleSQL, which takes hours, so the build is done in two
+# steps that share a layer cache kept in the registry:
+#
+#   1. the `deps` stage (toolchain + prebuilt GoogleSQL), cached as soon as it
+#      finishes, so a run that later runs out of time keeps that work;
+#   2. the emulator itself, which starts from the cached `deps` layers.
+#
+# The cache lives in GHCR rather than the Actions cache, which is capped at 10 GB
+# per repository and evicts a GoogleSQL build.
 on:
   workflow_dispatch:
   push:
-    branches: [perf/range-locking-and-hot-path]
+    branches: ['perf/**']
+    tags: ['v*']
+
+# One build per ref at a time; a queued push waits rather than cancelling a build
+# that is hours in.
+concurrency:
+  group: build-emulator-image-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/cloud-spanner-emulator
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -19,22 +44,47 @@ jobs:
           large-packages: true
           swap-storage: true
           docker-images: false
+
       - uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push (linux/amd64)
+
+      # Tags and labels. The source label links the package to this repository, so
+      # it takes this repository's visibility and permissions.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=perf,enable=${{ github.ref_type == 'branch' }}
+            type=sha,format=long
+            type=ref,event=tag
+
+      - name: Build and cache the dependency stage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          target: deps
+          platforms: linux/amd64
+          push: false
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+      - name: Build and push the image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: build/docker/Dockerfile.ubuntu
           platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/cloud-spanner-emulator:perf
-            ghcr.io/${{ github.repository_owner }}/cloud-spanner-emulator:sha-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
